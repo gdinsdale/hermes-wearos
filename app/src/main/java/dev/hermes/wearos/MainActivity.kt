@@ -49,6 +49,8 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.saveable.Saver
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -101,6 +103,7 @@ import dev.hermes.wearos.domain.DialSpin
 import dev.hermes.wearos.domain.DialVolume
 import dev.hermes.wearos.domain.FontScale
 import dev.hermes.wearos.domain.SlashCommands
+import dev.hermes.wearos.domain.SwipeNav
 import dev.hermes.wearos.domain.Lane
 import dev.hermes.wearos.domain.OrbDial
 import dev.hermes.wearos.domain.RenderCase
@@ -135,6 +138,34 @@ import kotlin.math.roundToInt
 
 /** Watch-local navigation (SPEC §3/§4): chat ⇄ chats-list ⇄ settings ⇄ gateway-sessions. No nav library. */
 enum class Screen { Chat, Chats, Settings, Sessions }
+
+/** Bundle form of [Screen]. Enums are not a safe auto-save (classloader), so the name rides. */
+private val screenSaver = Saver<Screen, String>(
+    save = { it.name },
+    restore = { runCatching { Screen.valueOf(it) }.getOrDefault(Screen.Chat) },
+)
+
+/**
+ * Last top-level screen, for the launch that comes back with no saved instance state.
+ * Wear returns to the watch face by finishing the task; the next tap is a new activity and
+ * `remember` / even `rememberSaveable` start over at Chat. One string, read synchronously so
+ * the first frame is already the screen the wearer left. Deep links do not consult this.
+ */
+private object NavPlace {
+    private const val PREFS = "nav_place"
+    private const val KEY = "screen"
+
+    fun load(context: android.content.Context): Screen {
+        val name = context.getSharedPreferences(PREFS, android.content.Context.MODE_PRIVATE)
+            .getString(KEY, null) ?: return Screen.Chat
+        return runCatching { Screen.valueOf(name) }.getOrDefault(Screen.Chat)
+    }
+
+    fun save(context: android.content.Context, screen: Screen) {
+        context.getSharedPreferences(PREFS, android.content.Context.MODE_PRIVATE)
+            .edit().putString(KEY, screen.name).commit()
+    }
+}
 
 /** Deep-link targets (M5): notification tap (open_chat), tile tap (talk), adb parity. */
 private data class DeepLink(val openChat: String? = null, val openProfile: String = "", val talk: Boolean = false, val nonce: Long = 0L)
@@ -231,7 +262,9 @@ class MainActivity : ComponentActivity() {
         parseDeepLink(intent)
         // Hold ONLY show-shaped launches (same question the gate asks, answered early with what
         // onCreate already knows; the gate's own verdict arrives with the settings read).
-        if (intent?.isLauncherLaunch() == true && deepLink.value == null) {
+        // A recreate (ambient / uiMode / the system handing the task back) already has a
+        // screen to return to — holding the launcher icon over it reads as "back to the start."
+        if (savedInstanceState == null && intent?.isLauncherLaunch() == true && deepLink.value == null) {
             val hold = SplashIntro.LaunchHold(android.os.SystemClock.elapsedRealtime())
             WearApp.Graph.launchHold = hold
             splash.setKeepOnScreenCondition { hold.holds(android.os.SystemClock.elapsedRealtime()) }
@@ -273,11 +306,20 @@ class MainActivity : ComponentActivity() {
                 val devEditor by WearApp.Graph.devEditor.collectAsState()
                 val gatewayLabel by WearApp.Graph.gatewayLabel.collectAsState()
 
-                var screen by remember { mutableStateOf(Screen.Chat) }
+                // Survives the recreate Wear does constantly (ambient, wrist down, low memory).
+                // `remember` alone restarts at Chat — the start screen — which is the "it jumped
+                // home" report. The bundle wins when the system actually saved state; a fresh
+                // instance (task cleared, savedInstanceState null) falls back to the last screen
+                // written below. A deep link still opens Chat.
+                var screen by rememberSaveable(stateSaver = screenSaver) {
+                    mutableStateOf(
+                        if (deepLink.value != null) Screen.Chat else NavPlace.load(this@MainActivity),
+                    )
+                }
                 // GEAR MEANS THE ROOT (owner 2026-11-11): a manually-opened Settings lands on the
                 // hub, never on a forced sub-page — the pairing takeover may still drive the page
                 // when IT opened the screen. Reset whenever the wearer leaves Settings.
-                var settingsManual by remember { mutableStateOf(false) }
+                var settingsManual by rememberSaveable { mutableStateOf(false) }
                 // BACK UNWINDS ONE SETTINGS LEVEL (owner 2026-11-11: "hw back button should back
                 // out from all sub-setting and sub-sub settings screens until you get back to
                 // chat"): SettingsScreen reports whether it has anything to pop; while it does,
@@ -293,6 +335,9 @@ class MainActivity : ComponentActivity() {
                     // Back law (PR #30): feed the activity-level source gate — synthesized (swipe)
                     // backs are swallowed only while a settings surface owns the screen.
                     settingsVisible[0] = screen == Screen.Settings
+                    // Wrist-down often finishes the task instead of recreating it, so the bundle
+                    // is gone on the way back. The last screen is what the next launch opens.
+                    NavPlace.save(this@MainActivity, screen)
                 }
                 // FIRST-RUN / NEEDS_AUTH PAIR GATE (SPEC §4, "tailnet only, always"): an empty
                 // registry or any engine edge into NEEDS_AUTH routes the wrist to Settings —
@@ -804,6 +849,10 @@ class MainActivity : ComponentActivity() {
                         // lane is a dial gesture, not a slice: the ring stays out of it.
                         val now = android.os.SystemClock.elapsedRealtime()
                         if (now - dialCommitAt.get() < 400L) return@SwipeForward
+                        // SETTINGS EXIT LAW (v0.10.2): only the hardware back leaves Settings.
+                        // BackRing maps Settings to Chat, so a horizontal swipe here was a
+                        // one-way trip home. Chats/Sessions keep the swipe.
+                        if (screen == Screen.Settings) return@SwipeForward
                         when (BackRing.action(screen)) {
                             BackRing.Action.ToSessions -> screen = Screen.Sessions
                             BackRing.Action.ToAgents -> {
@@ -1315,14 +1364,12 @@ private fun ExitOnSwipeBack(onBack: () -> Unit, content: @Composable () -> Unit)
     }
 }
 
-/** Forward leg of the ring under a FINGER (owner 2026-11-10): a horizontal drag leftward past
- *  [slop] anywhere in the body calls [onForward] once on release — and so does a LEFTWARD
- *  FLING that never travels far (owner 2026-11-10, real finger on real glass: short thumb
- *  flicks fell under the displacement threshold and the ring never advanced; injected
- *  full-screen swipes had masked it). A rightward drag CANCELLATES
- *  early so the system edge-back keeps its gesture. Vertical lists are untouched — a scrolling
- *  child consumes the stream and this detector bows out with it. Pure gesture, no state: the
- *  where-to logic stays in BackRing (unit-tested) beside the physical-back handler. */
+/** Forward leg of the ring under a FINGER (owner 2026-11-10). Decided once, on release, by
+ *  [dev.hermes.wearos.domain.SwipeNav]: a child that consumed the stream (edge-circle scroll or
+ *  the list) keeps it, and so does a move that travelled farther vertically than sideways.
+ *  The old check — 14 dp of horizontal travel within 220 ms, either direction, with no look at
+ *  the child — fired at the end of ordinary scrolls. Settings and Chats both rejoin the ring
+ *  at Chat, so the scroll landed on the start screen. Where-to stays in BackRing. */
 private val dialCommitAt = java.util.concurrent.atomic.AtomicLong(0L)
 
 @Composable
@@ -1333,37 +1380,34 @@ private fun SwipeForward(onForward: () -> Unit, content: @Composable () -> Unit)
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .pointerInput(slop) {
+            .pointerInput(slop, flickSlop, systemEdge) {
                 awaitEachGesture {
                     val down = awaitFirstDown(pass = PointerEventPass.Initial)
                     val nearLeftEdge = down.position.x < systemEdge
-                    var taken = false
+                    var childConsumed = false
+                    var dx = 0f
+                    var dy = 0f
+                    var elapsed = 0L
                     while (true) {
-                        val ev = awaitPointerEvent()
-                        val ch = ev.changes.last()
-                        // displacement from the DOWN POINT, not accumulated deltas:
-                        // a parent scroller that consumes vertical (real thumbs arc)
-                        // zeroes the per-event pan, and curved flicks wobble the sum.
-                        val dx = ch.position.x - down.position.x
-                        val elapsed = ch.uptimeMillis - down.uptimeMillis
-                        if (!taken) {
-                            // MIRROR-IMAGE LAW (owner 2026-11-10 ~22:2x: "both
-                            // directions advance, back only via the ring"): EITHER
-                            // horizontal direction, far enough (slow drag) or
-                            // far+fast (thumb flick, 220 ms window), advances the
-                            // ring one step. Only yield: a rightward flick begun in
-                            // the 24 dp system-edge strip stays the OS back gesture.
-                            val flick = dx <= -flickSlop || dx >= flickSlop
-                            val drag = dx <= -slop || dx >= slop
-                            val edgeBack = nearLeftEdge && dx >= flickSlop
-                            if (!edgeBack && (drag || (flick && elapsed <= 220L))) {
-                                taken = true
-                            }
+                        // Final pass: the list and the edge-circle have already had Initial
+                        // and Main, so a consumed change is theirs. Net displacement from the
+                        // DOWN point — per-event deltas lie when a parent scroller zeroes them.
+                        // The DOWN itself does not count: a button consumes it for a tap, and
+                        // that must not cancel a later sideways swipe that started on a row.
+                        val ev = awaitPointerEvent(PointerEventPass.Final)
+                        val ch = ev.changes.lastOrNull() ?: break
+                        dx = ch.position.x - down.position.x
+                        dy = ch.position.y - down.position.y
+                        elapsed = ch.uptimeMillis - down.uptimeMillis
+                        if ((dx != 0f || dy != 0f) && ev.changes.any { it.isConsumed }) {
+                            childConsumed = true
                         }
-                        if (taken) ev.changes.forEach { it.consume() }
                         if (ev.changes.none { it.pressed }) break
                     }
-                    if (taken) onForward()
+                    if (SwipeNav.shouldAdvance(
+                            dx, dy, elapsed, flickSlop, slop, nearLeftEdge, childConsumed,
+                        )
+                    ) onForward()
                 }
             },
     ) { content() }
