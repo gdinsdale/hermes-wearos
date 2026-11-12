@@ -67,12 +67,15 @@
 
         <!-- singleTask: notification/tile taps reuse the live instance (onNewIntent deep-links).
              adjustResize (owner batch 2 ask #6): the full-screen prompt editor shares this window,
-             so the system keyboard RESIZES it and the field stays visible above the IME. -->
+             so the system keyboard RESIZES it and the field stays visible above the IME.
+             No taskAffinity="". An empty value is parsed as "no affinity", and the Wear launcher
+             then fails to resume this task from Recents / the app list — it starts a new
+             MainActivity, which opens on Chat. The default package affinity is what lets
+             singleTask deliver the existing instance. -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
             android:launchMode="singleTask"
-            android:taskAffinity=""
             android:windowSoftInputMode="adjustResize"
             android:theme="@style/Theme.HermesWear.Starting">
             <intent-filter>

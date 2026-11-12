@@ -40,6 +40,8 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.Saver
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -201,7 +203,14 @@ fun SettingsScreen(
     // Settings tree (owner 2026-10-29: the flat screen became a "forever scroll"): root is a
     // hub of nav rows; every section lives on its own page. Sections below are UNCHANGED logic,
     // just wrapped in `if (page == …)` — same state, same prefs, same behavior.
-    var page by remember { mutableStateOf(SettingsPage.Root) }
+    // Same recreate hole as the top-level screen: a plain remember pops a sub-page
+    // (Gateways, Voice, …) back to the hub whenever Wear rebuilds the activity.
+    var page by rememberSaveable(
+        stateSaver = Saver(
+            save = { it.name },
+            restore = { runCatching { SettingsPage.valueOf(it) }.getOrDefault(SettingsPage.Root) },
+        ),
+    ) { mutableStateOf(SettingsPage.Root) }
     // Enrollment is a FULL PAGE of the Voice page, not a Dialog: this watch's
     // floating IME rises over activity-window fields (chat, prompt editor) and
     // stays deaf inside Dialog windows (owner: 'click the box, nothing happens').
